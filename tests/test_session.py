@@ -46,6 +46,14 @@ def test_guard_accepts_increase_and_rejects_single_drop():
     assert g.check("steps", 125, 0)         # ...confirmed by a second, lower read
 
 
+def test_guard_accepts_reset_that_is_already_climbing():
+    # Regression (2026-11-25 real session): console reset to 0 then kept climbing;
+    # the old rule demanded the 2nd read be <= the 1st low read and froze the counter.
+    g = proto.CounterGuard()
+    assert not g.check("duration_s", 1500, 3)
+    assert g.check("duration_s", 1500, 7)
+
+
 def test_guard_fields_are_independent():
     g = proto.CounterGuard()
     assert not g.check("steps", 100, 0)

@@ -170,23 +170,23 @@ class CounterGuard:
     The console's replies don't name the opcode they answer, so one late reply can be
     decoded as the wrong field. To HA's statistics a drop in a total_increasing sensor
     means a reset, so one bad sample would count the whole session twice. A drop is
-    accepted only once two reads in a row of the same counter agree on it. A real
-    reset, which is a new session, stays low and so passes on the second read.
+    accepted on the second read in a row that is also below the old value. A real
+    reset stays below it; a glitch goes back up. The second read doesn't have to equal
+    the first: after a real reset the counter is already climbing again.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[str, float] = {}
+        self._pending: set[str] = set()
 
     def check(self, field_name: str, old: float | None, new: float) -> bool:
         """Return True if ``new`` should replace ``old``."""
         if old is None or new >= old:
-            self._pending.pop(field_name, None)
+            self._pending.discard(field_name)
             return True
-        pending = self._pending.get(field_name)
-        if pending is not None and new <= pending:
-            self._pending.pop(field_name, None)
+        if field_name in self._pending:
+            self._pending.discard(field_name)
             return True
-        self._pending[field_name] = new
+        self._pending.add(field_name)
         return False
 
     def reset(self) -> None:

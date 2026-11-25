@@ -91,13 +91,23 @@ class SessionTracker:
 
         if status in (Status.RUNNING, Status.PAUSED):
             cur.absorb(r)
-            cur.ended = now
+            if r.status in (Status.RUNNING, Status.PAUSED):
+                cur.ended = now  # not while an unconfirmed summary is showing
         elif status in (Status.SUMMARY, Status.STANDBY):
             # Summary still shows the totals, so take them; standby may already
             # show zeros, which absorb()'s max ignores.
             cur.absorb(r)
             done += self._finish()
         return done
+
+    @property
+    def confirmed_status(self) -> int | None:
+        return self._confirmed_status
+
+    @property
+    def idle(self) -> bool:
+        """Console confirmed on standby or the summary screen."""
+        return self._confirmed_status in (Status.STANDBY, Status.SUMMARY)
 
     def disconnected(self, now: datetime) -> None:
         if self._disconnected_at is None:

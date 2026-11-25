@@ -305,3 +305,80 @@ async def test_session_event_and_last_session_sensors(hass: HomeAssistant):
     await hass.async_block_till_done()
     assert hass.states.get("sensor.lifespan_tm_2001_last_session_steps").state == "2600"
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def _frame(op, b2=0, b3=0, b4=0):
+    return bytes([0xA1, 0xAA, b2, b3, b4, 0])
+
+
+def _meter_total(series):
+    """What HA's utility meter / statistics add up from a total_increasing series."""
+    total, prev = 0, None
+    for v in series:
+        if v is None:
+            continue
+        if prev is None:
+            prev = v
+            continue
+        total += v if v < 0.9 * prev else max(v - prev, 0)
+        prev = v
+    return total
+
+
+async def test_replay_real_session_start_after_idle(hass: HomeAssistant):
+    """Replays 2026-11-25 16:26: idle console still showed 1 step / 11 s."""
+    coord = LifeSpanCoordinator(hass, MagicMock(), ADDR, "LifeSpan-TM", 10)
+    steps, secs = [], []
+    coord.async_add_listener(lambda: (steps.append(coord.data.steps), secs.append(coord.data.duration_s)))
+    S, D, ST = 0x88, 0x89, 0x91
+    seq = [
+        (ST, _frame(ST, 1)), (S, _frame(S, 0, 1)), (D, _frame(D, 0, 0, 11)),
+        (ST, _frame(ST, 1)),                       # standby confirmed
+        # user presses start; console zeroes and starts counting
+        (ST, _frame(ST, 3)),                       # first "running" -> hold
+        (S, _frame(S, 0, 0)), (D, _frame(D, 0, 0, 3)),
+        (ST, _frame(ST, 3)),                       # running confirmed -> commit
+        (S, _frame(S, 0, 3)), (D, _frame(D, 0, 0, 14)),
+        (S, _frame(S, 0, 4)), (D, _frame(D, 0, 0, 27)),
+        (ST, _frame(ST, 4)), (ST, _frame(ST, 4)),  # summary confirmed
+    ]
+    done = []
+    coord.async_add_session_listener(done.append)
+    for op, fr in seq:
+        coord._handle_frame(op, fr)
+    assert _meter_total(steps) == 4
+    assert _meter_total(secs) == 27
+    assert len(done) == 1 and (done[0].steps, done[0].duration_s) == (4, 27)
+
+
+async def test_bogus_running_read_while_idle_changes_nothing(hass: HomeAssistant):
+    coord = LifeSpanCoordinator(hass, MagicMock(), ADDR, "LifeSpan-TM", 10)
+    steps = []
+    coord.async_add_listener(lambda: steps.append(coord.data.steps))
+    S, ST = 0x88, 0x91
+    for op, fr in [
+        (ST, _frame(ST, 1)), (S, _frame(S, 0x0F, 0x6E)), (ST, _frame(ST, 1)),
+        (ST, _frame(ST, 3)),                       # single bogus running
+        (S, _frame(S, 0, 0)),                      # held, not published
+        (ST, _frame(ST, 1)),                       # back to standby -> release
+        (S, _frame(S, 0x0F, 0x6E)),
+    ]:
+        coord._handle_frame(op, fr)
+    assert coord._held is None
+    assert _meter_total(steps) == 0 and coord.data.steps == 3950
+    assert coord.tracker.current is None
+
+
+async def test_reconnect_mid_session_does_not_reset(hass: HomeAssistant):
+    """HA restart mid-walk: first status seen is running -> no hold, no zeroing."""
+    coord = LifeSpanCoordinator(hass, MagicMock(), ADDR, "LifeSpan-TM", 10)
+    steps = []
+    coord.async_add_listener(lambda: steps.append(coord.data.steps))
+    S, ST = 0x88, 0x91
+    for op, fr in [
+        (ST, _frame(ST, 3)), (S, _frame(S, 0x07, 0xD0)), (ST, _frame(ST, 3)),
+        (S, _frame(S, 0x07, 0xDA)),
+    ]:
+        coord._handle_frame(op, fr)
+    assert 0 not in steps and coord.data.steps == 2010
+    assert coord.tracker.current is not None

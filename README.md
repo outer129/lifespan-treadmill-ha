@@ -39,6 +39,10 @@ can't connect while Home Assistant holds the connection. To use the app, disable
   could be read as the wrong field. Late replies are dropped after a timeout. A counter
   *dropping* is accepted only once two reads in a row agree, so one bad read can't look
   like a reset and double-count a session.
+- **Session start:** between sessions the console keeps showing the last session's numbers.
+  When it goes from idle to *running*, counters are held until *running* is confirmed. HA then
+  gets an explicit reset to 0, followed by the new session's values, so leftovers are neither
+  subtracted from the new session nor counted twice.
 - **Session tracking:** a session opens when *running* is read twice in a row and stays open
   through pauses. It closes on *summary* or *standby*, when a new session is seen after a
   reconnect, or after 15 minutes without a connection. Sessions under 30 s with no steps are

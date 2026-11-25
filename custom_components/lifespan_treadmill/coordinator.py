@@ -33,6 +33,7 @@ from .protocol import (
     Opcode,
     ProtocolError,
     Readout,
+    Status,
     build_request,
     decode_into,
 )
@@ -87,6 +88,9 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
         self.source: str | None = None
         self.device_information: dict[str, str] = {}
         self._guard = CounterGuard()
+        # Counters read after the console may have started a new session from idle,
+        # held back until "running" is confirmed (see _handle_frame).
+        self._held: Readout | None = None
         self.tracker = SessionTracker()
         self.last_session: Session | None = None
         self._session_listeners: list[Callable[[Session], None]] = []
@@ -194,35 +198,103 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
                     await asyncio.sleep(LATE_REPLY_GRACE)  # drop any late reply
                     continue
                 missed = 0
-                new = replace(self.data, raw=dict(self.data.raw))
-                try:
-                    decode_into(new, opcode, frame)
-                except ProtocolError as err:
-                    _LOGGER.debug(
-                        "%s: bad reply to 0x%02x (%s): %s",
-                        self.address, opcode, frame.hex(" "), err,
-                    )
-                    continue
-                field_name = COUNTER_FIELDS.get(opcode)
-                if field_name and not self._guard.check(
-                    field_name, getattr(self.data, field_name), getattr(new, field_name)
-                ):
-                    _LOGGER.debug(
-                        "%s: holding back drop in %s (%s -> %s) until confirmed",
-                        self.address, field_name,
-                        getattr(self.data, field_name), getattr(new, field_name),
-                    )
-                    continue
-                self.async_set_updated_data(new)
-                self._sessions_completed(
-                    self.tracker.update(
-                        new, opcode == Opcode.STATUS, dt_util.utcnow()
-                    )
-                )
+                self._handle_frame(opcode, frame)
                 if self.data.session_active:
                     await asyncio.sleep(ACTIVE_GAP)
             if not self.data.session_active:
                 await asyncio.sleep(self.idle_interval)
+
+    @callback
+    def _handle_frame(self, opcode: Opcode, frame: bytes) -> None:
+        """Decode one reply, apply the glitch guard and session-start handling."""
+        now = dt_util.utcnow()
+        field_name = COUNTER_FIELDS.get(opcode)
+
+        if self._held is not None and field_name:
+            # Possible new session: keep its counters out of HA until confirmed.
+            try:
+                decode_into(self._held, opcode, frame)
+            except ProtocolError:
+                return
+            self._sessions_completed(self.tracker.update(self._truth(), False, now))
+            return
+
+        new = replace(self.data, raw=dict(self.data.raw))
+        try:
+            decode_into(new, opcode, frame)
+        except ProtocolError as err:
+            _LOGGER.debug(
+                "%s: bad reply to 0x%02x (%s): %s",
+                self.address, opcode, frame.hex(" "), err,
+            )
+            return
+        if field_name and not self._guard.check(
+            field_name, getattr(self.data, field_name), getattr(new, field_name)
+        ):
+            _LOGGER.debug(
+                "%s: holding back drop in %s (%s -> %s) until confirmed",
+                self.address, field_name,
+                getattr(self.data, field_name), getattr(new, field_name),
+            )
+            return
+
+        is_status = opcode == Opcode.STATUS
+        if is_status and self._held is None and self.tracker.idle and new.status == Status.RUNNING:
+            # The console zeroes its counters when a session starts, but HA may next read
+            # them after they have climbed past the previous session's leftovers. Then no
+            # reset is seen and the leftovers are subtracted from the new session.
+            _LOGGER.debug("%s: possible session start; holding counters", self.address)
+            self._held = Readout()
+
+        self.async_set_updated_data(new)
+        self._sessions_completed(self.tracker.update(self._truth(), is_status, now))
+
+        if self._held is None or not is_status:
+            return
+        if self.tracker.confirmed_status == Status.RUNNING:
+            self._commit_new_session()
+        elif self.tracker.idle and new.status in (Status.STANDBY, Status.SUMMARY):
+            _LOGGER.debug("%s: start was a glitch; releasing counters", self.address)
+            self._held = None
+
+    def _truth(self) -> Readout:
+        """Published readout, with held counters swapped in while holding."""
+        if self._held is None:
+            return self.data
+        h = self._held
+        return replace(
+            self.data,
+            steps=h.steps, distance=h.distance,
+            calories=h.calories, duration_s=h.duration_s,
+        )
+
+    @callback
+    def _commit_new_session(self) -> None:
+        """Publish an explicit reset to zero, then the new session's counters."""
+        held, self._held = self._held, None
+        assert held is not None
+        zero = replace(
+            self.data,
+            steps=0 if self.data.steps is not None else None,
+            distance=0.0 if self.data.distance is not None else None,
+            calories=0 if self.data.calories is not None else None,
+            duration_s=0 if self.data.duration_s is not None else None,
+        )
+        if zero != self.data:
+            self.async_set_updated_data(zero)
+        fresh = {
+            k: v
+            for k, v in (
+                ("steps", held.steps), ("distance", held.distance),
+                ("calories", held.calories), ("duration_s", held.duration_s),
+            )
+            if v is not None
+        }
+        raw = dict(self.data.raw)
+        raw.update(held.raw)
+        self.async_set_updated_data(replace(self.data, raw=raw, **fresh))
+        self._guard.reset()
+        _LOGGER.debug("%s: new session confirmed; counters reset", self.address)
 
     async def _read_device_information(self, client: BleakClient) -> None:
         """Read the standard Device Information Service (0x180A), if present."""
