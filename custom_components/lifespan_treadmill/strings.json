@@ -51,11 +51,41 @@
       },
       "calories": {
         "name": "Calories"
+      },
+      "last_session_ended": {
+        "name": "Last session ended"
+      },
+      "last_session_duration": {
+        "name": "Last session duration"
+      },
+      "last_session_steps": {
+        "name": "Last session steps"
+      },
+      "last_session_distance": {
+        "name": "Last session distance"
+      },
+      "last_session_calories": {
+        "name": "Last session calories"
+      },
+      "last_session_average_speed": {
+        "name": "Last session average speed"
       }
     },
     "binary_sensor": {
       "running": {
         "name": "Running"
+      }
+    },
+    "event": {
+      "session": {
+        "name": "Session",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "session_completed": "Session completed"
+            }
+          }
+        }
       }
     }
   }

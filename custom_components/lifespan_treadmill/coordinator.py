@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 
 from bleak import BleakClient
@@ -19,19 +20,23 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .protocol import (
     ACTIVE_ROTATION,
+    COUNTER_FIELDS,
     IDLE_ROTATION,
     NOTIFY_CHAR_UUID,
     WRITE_CHAR_UUID,
+    CounterGuard,
     Opcode,
     ProtocolError,
     Readout,
     build_request,
     decode_into,
 )
+from .session import Session, SessionTracker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +44,9 @@ RESPONSE_TIMEOUT = 2.0
 ACTIVE_GAP = 0.25  # seconds between requests while a session is active
 MAX_MISSED = 6  # consecutive unanswered requests before forcing a reconnect
 RECONNECT_BACKOFF = (5, 10, 30, 60)
+# After a timeout, ignore notifications this long so a late reply can't be
+# mistaken for the answer to the next request.
+LATE_REPLY_GRACE = 0.75
 
 # Standard BLE Device Information Service characteristics.
 DIS_CHARACTERISTICS = {
@@ -78,6 +86,26 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
         self.rssi: int | None = None
         self.source: str | None = None
         self.device_information: dict[str, str] = {}
+        self._guard = CounterGuard()
+        self.tracker = SessionTracker()
+        self.last_session: Session | None = None
+        self._session_listeners: list[Callable[[Session], None]] = []
+
+    @callback
+    def async_add_session_listener(
+        self, listener: Callable[[Session], None]
+    ) -> Callable[[], None]:
+        """Call ``listener`` with each completed session."""
+        self._session_listeners.append(listener)
+        return lambda: self._session_listeners.remove(listener)
+
+    @callback
+    def _sessions_completed(self, sessions: list[Session]) -> None:
+        for session in sessions:
+            _LOGGER.debug("%s: session completed: %s", self.address, session)
+            self.last_session = session
+            for listener in list(self._session_listeners):
+                listener(session)
 
     # ------------------------------------------------------------------ setup
     @callback
@@ -103,6 +131,7 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
             )
             if device is None:
                 self._mark_disconnected("not in range of any connectable adapter")
+                self._sessions_completed(self.tracker.check_timeout(dt_util.utcnow()))
                 self._seen.clear()
                 try:
                     await asyncio.wait_for(self._seen.wait(), timeout=60)
@@ -121,6 +150,7 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
             delay = RECONNECT_BACKOFF[min(attempt, len(RECONNECT_BACKOFF) - 1)]
             attempt += 1
             self._mark_disconnected("disconnected")
+            self._sessions_completed(self.tracker.check_timeout(dt_util.utcnow()))
             await asyncio.sleep(delay)
 
     async def async_shutdown(self) -> None:
@@ -143,6 +173,7 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
         if write_char is None or notify_char is None:
             raise BleakError("console is missing FFF1/FFF2 characteristics")
         self._write_with_response = "write" in write_char.properties
+        self._guard.reset()
         await self._read_device_information(client)
         await client.start_notify(notify_char, self._on_notify)
         self.connected = True
@@ -160,6 +191,7 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
                     missed += 1
                     if missed >= MAX_MISSED:
                         raise TimeoutError("console stopped answering")
+                    await asyncio.sleep(LATE_REPLY_GRACE)  # drop any late reply
                     continue
                 missed = 0
                 new = replace(self.data, raw=dict(self.data.raw))
@@ -171,7 +203,22 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
                         self.address, opcode, frame.hex(" "), err,
                     )
                     continue
+                field_name = COUNTER_FIELDS.get(opcode)
+                if field_name and not self._guard.check(
+                    field_name, getattr(self.data, field_name), getattr(new, field_name)
+                ):
+                    _LOGGER.debug(
+                        "%s: holding back drop in %s (%s -> %s) until confirmed",
+                        self.address, field_name,
+                        getattr(self.data, field_name), getattr(new, field_name),
+                    )
+                    continue
                 self.async_set_updated_data(new)
+                self._sessions_completed(
+                    self.tracker.update(
+                        new, opcode == Opcode.STATUS, dt_util.utcnow()
+                    )
+                )
                 if self.data.session_active:
                     await asyncio.sleep(ACTIVE_GAP)
             if not self.data.session_active:
@@ -256,6 +303,7 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
 
     @callback
     def _mark_disconnected(self, reason: str) -> None:
+        self.tracker.disconnected(dt_util.utcnow())
         if self.last_update_success:
             _LOGGER.debug("%s: unavailable (%s)", self.address, reason)
             self.async_set_update_error(BleakError(reason))

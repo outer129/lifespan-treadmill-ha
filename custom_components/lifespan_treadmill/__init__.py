@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from .const import CONF_IDLE_INTERVAL, DEFAULT_IDLE_INTERVAL
 from .coordinator import LifeSpanCoordinator
 
-PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.EVENT, Platform.SENSOR]
 
 type LifeSpanConfigEntry = ConfigEntry[LifeSpanCoordinator]
 

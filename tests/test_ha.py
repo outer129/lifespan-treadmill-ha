@@ -127,7 +127,9 @@ async def test_unanswered_requests_force_reconnect(hass: HomeAssistant):
     with patch(
         "custom_components.lifespan_treadmill.coordinator.establish_connection",
         return_value=fake,
-    ), patch("custom_components.lifespan_treadmill.coordinator.RESPONSE_TIMEOUT", 0.01):
+    ), patch("custom_components.lifespan_treadmill.coordinator.RESPONSE_TIMEOUT", 0.01), patch(
+        "custom_components.lifespan_treadmill.coordinator.LATE_REPLY_GRACE", 0
+    ):
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(coord._connect_and_poll(MagicMock()), 3)
 
@@ -191,4 +193,115 @@ async def test_full_setup_registers_device_and_entities(hass: HomeAssistant):
     )
     diag = await async_get_config_entry_diagnostics(hass, entry)
     assert diag["connected"] is False and diag["options"]["unit"] == "mph"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+class LateConsole(FakeConsole):
+    """Answers STEPS late, after the request timed out."""
+
+    async def write_gatt_char(self, uuid, data, response):
+        op = data[1]
+        self.writes.append(op)
+        loop = asyncio.get_running_loop()
+        delay = 0.08 if op == 0x88 and len(self.writes) > 12 else 0.001
+        loop.call_later(delay, self.cb, None, bytearray(self.answers[op]))
+
+
+async def test_late_reply_is_not_misassigned(hass: HomeAssistant):
+    """A late calories-sized reply must never land on steps (or anything else)."""
+    answers = dict(ANSWERS)
+    coord = LifeSpanCoordinator(hass, MagicMock(), ADDR, "LifeSpan-TM", 10)
+    fake = LateConsole(answers)
+    seen_steps = []
+    coord.async_add_listener(lambda: seen_steps.append(coord.data.steps))
+    with patch(
+        "custom_components.lifespan_treadmill.coordinator.establish_connection",
+        return_value=fake,
+    ), patch("custom_components.lifespan_treadmill.coordinator.ACTIVE_GAP", 0), patch(
+        "custom_components.lifespan_treadmill.coordinator.RESPONSE_TIMEOUT", 0.04
+    ), patch("custom_components.lifespan_treadmill.coordinator.LATE_REPLY_GRACE", 0.06):
+        task = asyncio.create_task(coord._connect_and_poll(MagicMock()))
+        await asyncio.sleep(1.0)
+        fake.is_connected = False
+        await asyncio.wait_for(task, 3)
+    d = coord.data
+    assert (d.speed, d.distance, d.duration_s, d.calories) == (2.2, 1.31, 4005, 235)
+    assert all(v in (None, 3950) for v in seen_steps)
+
+
+async def test_guard_holds_single_drop_in_coordinator(hass: HomeAssistant):
+    coord = LifeSpanCoordinator(hass, MagicMock(), ADDR, "LifeSpan-TM", 10)
+    coord.data.steps = 3950
+    answers = dict(ANSWERS)
+    answers[0x88] = bytes.fromhex("a1aa00eb0000")  # 235 — a calories value
+    fake = FakeConsole(answers)
+    with patch(
+        "custom_components.lifespan_treadmill.coordinator.establish_connection",
+        return_value=fake,
+    ), patch("custom_components.lifespan_treadmill.coordinator.ACTIVE_GAP", 0):
+        task = asyncio.create_task(coord._connect_and_poll(MagicMock()))
+        # wait for the first steps poll only
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if fake.writes.count(0x88) == 1 and coord.data.status is not None:
+                break
+        assert coord.data.steps == 3950  # first low read held back
+        for _ in range(400):
+            await asyncio.sleep(0.005)
+            if fake.writes.count(0x88) >= 2:
+                break
+        await asyncio.sleep(0.02)
+        fake.is_connected = False
+        await asyncio.wait_for(task, 3)
+    assert coord.data.steps == 235  # confirmed by second read -> accepted
+
+
+async def test_session_event_and_last_session_sensors(hass: HomeAssistant):
+    from datetime import timedelta
+
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+    from homeassistant.util import dt as dt_util
+
+    from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
+
+    from custom_components.lifespan_treadmill.session import Session
+
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    hass.config.components.update({"bluetooth", "bluetooth_adapters"})
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="LifeSpan-TM-2001", unique_id=ADDR,
+        data={"address": ADDR}, options={"unit": "mph", "idle_interval": 10},
+    )
+    entry.add_to_hass(hass)
+
+    async def fake_run(self):
+        return
+
+    with patch(
+        "custom_components.lifespan_treadmill.bluetooth.async_register_callback",
+        return_value=lambda: None,
+    ), patch.object(LifeSpanCoordinator, "async_run", fake_run):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    ev = "event.lifespan_tm_2001_session"
+    assert hass.states.get(ev).state == "unknown"
+    end = dt_util.utcnow().replace(microsecond=0)
+    entry.runtime_data._sessions_completed(
+        [Session(started=end - timedelta(minutes=30), ended=end,
+                 duration_s=1800, steps=2600, distance=1.25, calories=110)]
+    )
+    await hass.async_block_till_done()
+    st = hass.states.get(ev)
+    assert st.attributes["event_type"] == "session_completed"
+    assert st.attributes["steps"] == 2600 and st.attributes["distance_unit"] == "mi"
+    assert st.attributes["average_speed"] == 2.5
+    assert hass.states.get("sensor.lifespan_tm_2001_last_session_steps").state == "2600"
+    assert hass.states.get("sensor.lifespan_tm_2001_last_session_distance").state == "1.25"
+    assert hass.states.get("sensor.lifespan_tm_2001_last_session_average_speed").state == "2.5"
+    assert hass.states.get("sensor.lifespan_tm_2001_last_session_ended").state == end.isoformat()
+    # Live data updates must not wipe the last-session values.
+    entry.runtime_data.async_set_updated_data(entry.runtime_data.data)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.lifespan_tm_2001_last_session_steps").state == "2600"
     assert await hass.config_entries.async_unload(entry.entry_id)

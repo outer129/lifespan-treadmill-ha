@@ -153,3 +153,41 @@ def decode_into(readout: Readout, opcode: int, frame: bytes) -> None:
     else:
         return
     readout.raw[Opcode(opcode).name.lower()] = frame.hex(" ")
+
+
+# Per-session cumulative counters on the console, keyed by the opcode that reads them.
+COUNTER_FIELDS: dict[int, str] = {
+    Opcode.STEPS: "steps",
+    Opcode.DISTANCE: "distance",
+    Opcode.CALORIES: "calories",
+    Opcode.DURATION: "duration_s",
+}
+
+
+class CounterGuard:
+    """Reject single-sample drops in the console's cumulative counters.
+
+    The console's replies don't name the opcode they answer, so one late reply can be
+    decoded as the wrong field. To HA's statistics a drop in a total_increasing sensor
+    means a reset, so one bad sample would count the whole session twice. A drop is
+    accepted only once two reads in a row of the same counter agree on it. A real
+    reset, which is a new session, stays low and so passes on the second read.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[str, float] = {}
+
+    def check(self, field_name: str, old: float | None, new: float) -> bool:
+        """Return True if ``new`` should replace ``old``."""
+        if old is None or new >= old:
+            self._pending.pop(field_name, None)
+            return True
+        pending = self._pending.get(field_name)
+        if pending is not None and new <= pending:
+            self._pending.pop(field_name, None)
+            return True
+        self._pending[field_name] = new
+        return False
+
+    def reset(self) -> None:
+        self._pending.clear()
