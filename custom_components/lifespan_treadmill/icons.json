@@ -1,0 +1,21 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "running": { "default": "mdi:walk", "state": { "off": "mdi:human-handsdown" } }
+    },
+    "sensor": {
+      "status": {
+        "default": "mdi:treadmill",
+        "state": {
+          "running": "mdi:run",
+          "paused": "mdi:pause-circle-outline",
+          "standby": "mdi:power-sleep",
+          "summary": "mdi:clipboard-text-outline"
+        }
+      },
+      "steps": { "default": "mdi:shoe-print" },
+      "session_time": { "default": "mdi:timer-outline" },
+      "calories": { "default": "mdi:fire" }
+    }
+  }
+}

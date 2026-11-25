@@ -19,6 +19,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: LifeSpanConfigEntry) -> 
     address: str = entry.data[CONF_ADDRESS]
     coordinator = LifeSpanCoordinator(
         hass,
+        entry,
         address,
         entry.title,
         entry.options.get(CONF_IDLE_INTERVAL, DEFAULT_IDLE_INTERVAL),

@@ -11,7 +11,12 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import UnitOfLength, UnitOfSpeed, UnitOfTime
+from homeassistant.const import (
+    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    EntityCategory,
+    UnitOfLength, UnitOfSpeed,
+    UnitOfTime,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -19,6 +24,8 @@ from . import LifeSpanConfigEntry
 from .const import CONF_UNIT, DEFAULT_UNIT, UNIT_KMH
 from .entity import LifeSpanEntity
 from .protocol import STATUS_NAMES, Readout
+
+PARALLEL_UPDATES = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -89,7 +96,10 @@ async def async_setup_entry(
     metric = entry.options.get(CONF_UNIT, DEFAULT_UNIT) == UNIT_KMH
     coordinator = entry.runtime_data
     async_add_entities(
-        LifeSpanSensor(coordinator, d) for d in _descriptions(metric)
+        [
+            *(LifeSpanSensor(coordinator, d) for d in _descriptions(metric)),
+            LifeSpanSignalStrength(coordinator),
+        ]
     )
 
 
@@ -110,3 +120,24 @@ class LifeSpanSensor(LifeSpanEntity, SensorEntity):
         if self.entity_description.key == "session_time":
             raw = self.coordinator.data.raw.get("duration")
         return {"raw_frame": raw} if raw else None
+
+
+class LifeSpanSignalStrength(LifeSpanEntity, SensorEntity):
+    """RSSI of the last advertisement (diagnostic, disabled by default)."""
+
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "rssi")
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.rssi is not None
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.rssi

@@ -45,6 +45,8 @@ async def test_bluetooth_discovery_flow(hass: HomeAssistant):
     assert result["title"] == "LifeSpan-TM"
     assert result["data"] == {"address": ADDR}
     assert result["options"]["unit"] == "mph"
+    with patch("custom_components.lifespan_treadmill.async_unload_entry", return_value=True):
+        await hass.config_entries.async_unload(result["result"].entry_id)
 
 
 class FakeConsole:
@@ -56,9 +58,20 @@ class FakeConsole:
         self.is_connected = True
         self.cb = None
         self.writes = []
-        char = MagicMock(properties=["write"])
         self.services = MagicMock()
-        self.services.get_characteristic.return_value = char
+        self.services.get_characteristic.side_effect = (
+            lambda uuid: MagicMock(uuid=uuid, properties=["write", "notify", "read"])
+        )
+
+    DIS = {
+        "00002a24-0000-1000-8000-00805f9b34fb": b"SC110\x00",
+        "00002a26-0000-1000-8000-00805f9b34fb": b"V1.2 ",
+    }
+
+    async def read_gatt_char(self, char):
+        if char.uuid not in self.DIS:
+            raise BleakError("not readable")
+        return bytearray(self.DIS[char.uuid])
 
     async def start_notify(self, _char, cb):
         self.cb = cb
@@ -87,7 +100,7 @@ ANSWERS = {
 
 
 async def test_poll_loop_decodes(hass: HomeAssistant):
-    coord = LifeSpanCoordinator(hass, ADDR, "LifeSpan-TM", 10)
+    coord = LifeSpanCoordinator(hass, MagicMock(), ADDR, "LifeSpan-TM", 10)
     fake = FakeConsole(ANSWERS)
     with patch(
         "custom_components.lifespan_treadmill.coordinator.establish_connection",
@@ -102,13 +115,14 @@ async def test_poll_loop_decodes(hass: HomeAssistant):
         await asyncio.wait_for(task, 3)
     d = coord.data
     assert coord.last_update_success
+    assert coord.device_information == {"model": "SC110", "firmware": "V1.2"}
     assert (d.status_name, d.speed, d.steps, d.distance, d.duration_s, d.calories) == (
         "running", 2.2, 3950, 1.31, 4005, 235
     )
 
 
 async def test_unanswered_requests_force_reconnect(hass: HomeAssistant):
-    coord = LifeSpanCoordinator(hass, ADDR, "LifeSpan-TM", 10)
+    coord = LifeSpanCoordinator(hass, MagicMock(), ADDR, "LifeSpan-TM", 10)
     fake = FakeConsole(ANSWERS, drop=set(ANSWERS))
     with patch(
         "custom_components.lifespan_treadmill.coordinator.establish_connection",
@@ -119,7 +133,7 @@ async def test_unanswered_requests_force_reconnect(hass: HomeAssistant):
 
 
 async def test_disconnect_mid_request_raises(hass: HomeAssistant):
-    coord = LifeSpanCoordinator(hass, ADDR, "LifeSpan-TM", 10)
+    coord = LifeSpanCoordinator(hass, MagicMock(), ADDR, "LifeSpan-TM", 10)
     fake = FakeConsole(ANSWERS, drop={0x91})
     with patch(
         "custom_components.lifespan_treadmill.coordinator.establish_connection",
@@ -130,3 +144,51 @@ async def test_disconnect_mid_request_raises(hass: HomeAssistant):
         coord._on_disconnect(fake)
         with pytest.raises(BleakError):
             await asyncio.wait_for(task, 3)
+
+
+async def test_full_setup_registers_device_and_entities(hass: HomeAssistant):
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+    from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+    hass.config.components.update({"bluetooth", "bluetooth_adapters"})
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="LifeSpan-TM-2001", unique_id=ADDR,
+        data={"address": ADDR}, options={"unit": "mph", "idle_interval": 10},
+    )
+    entry.add_to_hass(hass)
+    started = asyncio.Event()
+
+    async def fake_run(self):
+        started.set()
+
+    with patch(
+        "custom_components.lifespan_treadmill.bluetooth.async_register_callback",
+        return_value=lambda: None,
+    ), patch.object(LifeSpanCoordinator, "async_run", fake_run):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    dev = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, ADDR), entry.entry_id)
+    assert dev.manufacturer == "LifeSpan Fitness"
+    assert (dr.CONNECTION_BLUETOOTH, ADDR) in dev.connections
+
+    ents = {e.unique_id: e for e in er.async_entries_for_device(er.async_get(hass), dev.id, include_disabled_entities=True)}
+    assert ents[f"{ADDR}_connected"].entity_category == "diagnostic"
+    assert ents[f"{ADDR}_rssi"].disabled_by == er.RegistryEntryDisabler.INTEGRATION
+    assert ents[f"{ADDR}_running"].entity_id == "binary_sensor.lifespan_tm_2001_running"
+    assert hass.states.get("binary_sensor.lifespan_tm_2001_connectivity").state == "off"
+    assert hass.states.get("sensor.lifespan_tm_2001_speed").state == "unavailable"
+
+    # device registry gets DIS info once read
+    coord = entry.runtime_data
+    coord.device_information = {"model": "SC110", "firmware": "V1.2"}
+    coord._update_device_registry()
+    dev = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, ADDR), entry.entry_id)
+    assert (dev.model_id, dev.sw_version) == ("SC110", "V1.2")
+
+    from custom_components.lifespan_treadmill.diagnostics import (
+        async_get_config_entry_diagnostics,
+    )
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+    assert diag["connected"] is False and diag["options"]["unit"] == "mph"
+    assert await hass.config_entries.async_unload(entry.entry_id)

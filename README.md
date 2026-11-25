@@ -14,6 +14,12 @@ ESPHome Bluetooth proxy** (the proxy must have `active: true`).
 | Steps | current session |
 | Session time | current session |
 | Calories | current session (kcal) |
+| Connectivity (diagnostic) | whether HA holds the BLE link; `adapter` attribute names the proxy in use |
+| Signal strength (diagnostic) | RSSI, disabled by default |
+
+The device's firmware, hardware and serial number come from the console's standard
+Device Information Service, if it has one. **Download diagnostics** on the integration page dumps the
+current state, which is useful when reporting a decoding issue.
 
 Each sensor also has a `raw_frame` attribute with the last reply from the console, which helps check the decoding.
 

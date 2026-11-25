@@ -4,11 +4,16 @@
     "step": {
       "bluetooth_confirm": {
         "description": "Set up {name}? Make sure the LifeSpan Fit app is closed, since the console only accepts one Bluetooth connection.",
-        "data": { "unit": "Unit shown on the console" }
+        "data": {
+          "unit": "Unit shown on the console"
+        }
       },
       "user": {
         "description": "Choose the LifeSpan console to set up.",
-        "data": { "address": "Device", "unit": "Unit shown on the console" }
+        "data": {
+          "address": "Device",
+          "unit": "Unit shown on the console"
+        }
       }
     },
     "abort": {
@@ -30,11 +35,28 @@
     "sensor": {
       "status": {
         "name": "Status",
-        "state": { "standby": "Standby", "running": "Running", "paused": "Paused", "summary": "Summary", "unknown": "Unknown" }
+        "state": {
+          "standby": "Standby",
+          "running": "Running",
+          "paused": "Paused",
+          "summary": "Summary",
+          "unknown": "Unknown"
+        }
       },
-      "steps": { "name": "Steps" },
-      "session_time": { "name": "Session time" },
-      "calories": { "name": "Calories" }
+      "steps": {
+        "name": "Steps"
+      },
+      "session_time": {
+        "name": "Session time"
+      },
+      "calories": {
+        "name": "Calories"
+      }
+    },
+    "binary_sensor": {
+      "running": {
+        "name": "Running"
+      }
     }
   }
 }

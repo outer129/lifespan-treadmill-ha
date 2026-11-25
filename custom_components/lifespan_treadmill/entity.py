@@ -19,6 +19,6 @@ class LifeSpanEntity(CoordinatorEntity[LifeSpanCoordinator]):
             identifiers={(DOMAIN, coordinator.address)},
             connections={(CONNECTION_BLUETOOTH, coordinator.address)},
             manufacturer=MANUFACTURER,
-            model="Treadmill console (SC110 / Omni)",
+            model="Treadmill console",
             name=coordinator.device_name,
         )

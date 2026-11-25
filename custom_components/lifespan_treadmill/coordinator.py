@@ -15,7 +15,9 @@ from bleak_retry_connector import (
 )
 
 from homeassistant.components import bluetooth
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
@@ -38,14 +40,31 @@ ACTIVE_GAP = 0.25  # seconds between requests while a session is active
 MAX_MISSED = 6  # consecutive unanswered requests before forcing a reconnect
 RECONNECT_BACKOFF = (5, 10, 30, 60)
 
+# Standard BLE Device Information Service characteristics.
+DIS_CHARACTERISTICS = {
+    "manufacturer": "00002a29-0000-1000-8000-00805f9b34fb",
+    "model": "00002a24-0000-1000-8000-00805f9b34fb",
+    "serial": "00002a25-0000-1000-8000-00805f9b34fb",
+    "hardware": "00002a27-0000-1000-8000-00805f9b34fb",
+    "firmware": "00002a26-0000-1000-8000-00805f9b34fb",
+    "software": "00002a28-0000-1000-8000-00805f9b34fb",
+}
+
 
 class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
     """Holds a BLE connection to the console and polls it."""
 
     def __init__(
-        self, hass: HomeAssistant, address: str, name: str, idle_interval: int
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        address: str,
+        name: str,
+        idle_interval: int,
     ) -> None:
-        super().__init__(hass, _LOGGER, name=f"{DOMAIN} {address}")
+        super().__init__(
+            hass, _LOGGER, config_entry=entry, name=f"{DOMAIN} {address}"
+        )
         self.address = address
         self.device_name = name
         self.idle_interval = idle_interval
@@ -56,6 +75,9 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
         self._response: asyncio.Future[bytes] | None = None
         self._seen = asyncio.Event()
         self._write_with_response = True
+        self.rssi: int | None = None
+        self.source: str | None = None
+        self.device_information: dict[str, str] = {}
 
     # ------------------------------------------------------------------ setup
     @callback
@@ -64,8 +86,13 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
         service_info: bluetooth.BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        """Wake the run loop when the console advertises."""
+        """Track signal/adapter and wake the run loop when the console advertises."""
+        self.rssi = service_info.rssi
+        self.source = service_info.source
         self._seen.set()
+        if self.connected:
+            return  # entities refresh on the next poll anyway
+        self.async_update_listeners()
 
     async def async_run(self) -> None:
         """Run forever: connect, poll, reconnect."""
@@ -116,8 +143,10 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
         if write_char is None or notify_char is None:
             raise BleakError("console is missing FFF1/FFF2 characteristics")
         self._write_with_response = "write" in write_char.properties
+        await self._read_device_information(client)
         await client.start_notify(notify_char, self._on_notify)
         self.connected = True
+        self.async_update_listeners()
         _LOGGER.info("Connected to LifeSpan console %s", self.address)
 
         missed = 0
@@ -148,6 +177,43 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
             if not self.data.session_active:
                 await asyncio.sleep(self.idle_interval)
 
+    async def _read_device_information(self, client: BleakClient) -> None:
+        """Read the standard Device Information Service (0x180A), if present."""
+        info: dict[str, str] = {}
+        for key, uuid in DIS_CHARACTERISTICS.items():
+            char = client.services.get_characteristic(uuid)
+            if char is None:
+                continue
+            try:
+                value = (await client.read_gatt_char(char)).decode(errors="ignore")
+            except BleakError as err:
+                _LOGGER.debug("%s: could not read %s: %s", self.address, key, err)
+                continue
+            if value := value.strip("\x00 ").strip():
+                info[key] = value
+        if info != self.device_information:
+            self.device_information = info
+            self._update_device_registry()
+
+    @callback
+    def _update_device_registry(self) -> None:
+        info = self.device_information
+        dev_reg = dr.async_get(self.hass)
+        device = dev_reg.async_get_device_by_identifier(
+            (DOMAIN, self.address), self.config_entry.entry_id
+        )
+        if device is None:
+            return
+        updates = {
+            "sw_version": info.get("firmware") or info.get("software"),
+            "hw_version": info.get("hardware"),
+            "serial_number": info.get("serial"),
+            "model_id": info.get("model"),
+        }
+        dev_reg.async_update_device(
+            device.id, **{k: v for k, v in updates.items() if v}
+        )
+
     async def _request(self, client: BleakClient, opcode: Opcode) -> bytes | None:
         """Send one request and wait for its (un-tagged) reply."""
         loop = asyncio.get_running_loop()
@@ -174,6 +240,7 @@ class LifeSpanCoordinator(DataUpdateCoordinator[Readout]):
     def _on_disconnect(self, _client: BleakClient) -> None:
         _LOGGER.debug("%s: disconnected", self.address)
         self.connected = False
+        self.hass.loop.call_soon_threadsafe(self.async_update_listeners)
         fut = self._response
         if fut is not None and not fut.done():
             fut.set_exception(BleakError("disconnected"))
