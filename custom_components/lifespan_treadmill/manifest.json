@@ -1,0 +1,23 @@
+{
+  "domain": "lifespan_treadmill",
+  "name": "LifeSpan Treadmill",
+  "bluetooth": [
+    {
+      "local_name": "LifeSpan*",
+      "connectable": true
+    }
+  ],
+  "codeowners": [
+    "@outer129"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "bluetooth_adapters"
+  ],
+  "documentation": "https://github.com/outer129/lifespan-treadmill-ha",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/outer129/lifespan-treadmill-ha/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
